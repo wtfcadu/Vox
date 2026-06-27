@@ -12,7 +12,11 @@
 //
 
 import SwiftUI
+#if os(iOS)
 import UIKit
+#elseif os(macOS)
+import AppKit
+#endif
 
 // MARK: - Cached Async Image
 
@@ -21,7 +25,11 @@ struct CachedAsyncImage<Placeholder: View>: View {
     let placeholder: Placeholder
     let contentMode: ContentMode
 
+    #if os(iOS)
     @State private var image: UIImage?
+    #elseif os(macOS)
+    @State private var image: NSImage?
+    #endif
     @State private var didAttemptLoad = false
 
     init(url: URL?, @ViewBuilder placeholder: () -> Placeholder, contentMode: ContentMode = .fill) {
@@ -33,9 +41,15 @@ struct CachedAsyncImage<Placeholder: View>: View {
     var body: some View {
         Group {
             if let image = image {
+                #if os(iOS)
                 Image(uiImage: image)
                     .resizable()
                     .aspectRatio(contentMode: contentMode)
+                #elseif os(macOS)
+                Image(nsImage: image)
+                    .resizable()
+                    .aspectRatio(contentMode: contentMode)
+                #endif
             } else if !didAttemptLoad {
                 placeholder
                     .onAppear { load() }
@@ -64,10 +78,17 @@ struct CachedAsyncImage<Placeholder: View>: View {
                 request.setValue("Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X)", forHTTPHeaderField: "User-Agent")
                 
                 let (data, _) = try await URLSession.shared.data(for: request)
+                #if os(iOS)
                 if let uiImage = UIImage(data: data) {
                     await ImageCacheService.shared.setImage(uiImage, for: url)
                     self.image = uiImage // Safely triggers UI redraw on main thread
                 }
+                #elseif os(macOS)
+                if let nsImage = NSImage(data: data) {
+                    await ImageCacheService.shared.setImage(nsImage, for: url)
+                    self.image = nsImage // Safely triggers UI redraw on main thread
+                }
+                #endif
             } catch {
                 print("[CachedAsyncImage] Failed to load URL: \(url.absoluteString) - Error: \(error)")
             }
