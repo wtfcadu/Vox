@@ -17,6 +17,7 @@ import AppKit
 // (public typealias CornerType = UIRectCorner / CACornerMask).
 // It was never referenced in this file and belongs in RoundedCorner.swift if needed.
 
+@available(iOS 17, *)
 struct MiniPlayerView: View {
     @Environment(PlayerManager.self) var player
 

@@ -12,6 +12,7 @@ private extension UTType {
     static let epub = UTType(importedAs: "org.idpf.epub-container")
 }
 
+@available(iOS 17, *)
 struct LibraryView: View {
     @Environment(\.modelContext) private var context
     @Query private var books: [VoxBook]

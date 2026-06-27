@@ -14,6 +14,7 @@
 import SwiftUI
 import SwiftData
 
+@available(iOS 17, *)
 struct DownloadSheet: View {
     @Bindable var viewModel: DiscoverBookDetailViewModel
     let modelContext: ModelContext

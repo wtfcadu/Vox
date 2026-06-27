@@ -7,6 +7,7 @@ import SwiftUI
 import SwiftData
 
 @main
+@available(iOS 17, *)
 struct VoxEPUBApp: App {
     @State private var playerManager = PlayerManager()
 

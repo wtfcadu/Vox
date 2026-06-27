@@ -14,6 +14,7 @@
 import SwiftUI
 import SwiftData
 
+@available(iOS 17, *)
 struct DiscoverBookDetailView: View {
     let book: DiscoverBook
 
@@ -72,7 +73,7 @@ struct DiscoverBookDetailView: View {
         .onAppear {
             viewModel.checkLibrary(books: libraryBooks)
         }
-        .onChange(of: libraryBooks.count) {
+        .onChange(of: libraryBooks.count) { _, _ in
             viewModel.checkLibrary(books: libraryBooks)
         }
         .sheet(isPresented: $showDownloadSheet, onDismiss: {

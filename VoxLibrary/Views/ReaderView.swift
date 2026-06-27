@@ -13,6 +13,7 @@ import UIKit
 import AppKit
 #endif
 
+@available(iOS 17, *)
 struct ReaderView: View {
     @Environment(PlayerManager.self) var player
     @Environment(\.dismiss) var dismiss
