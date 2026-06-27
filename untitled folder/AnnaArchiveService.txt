@@ -1,0 +1,375 @@
+//
+//  AnnaArchiveService.swift
+//  VOXepub
+//
+//  Created by Carlos Junior on 27/06/26.
+//
+
+
+//
+//  AnnaArchiveService.swift
+//  VoxLibrary
+//
+//  ⚠️  UNOFFICIAL — This service parses Anna's Archive HTML pages.
+//  If the site changes its markup, the regex patterns below will need updating.
+//  The service degrades gracefully: on parse failure it offers a Safari fallback.
+//
+
+import Foundation
+
+final class AnnaArchiveService: Sendable {
+    private let session: URLSession
+
+    init(session: URLSession = .shared) {
+        var config = URLSessionConfiguration.default
+        // Anna's Archive may redirect; follow them
+
+        // Mimic a browser to reduce chance of blocks
+        config.httpAdditionalHeaders = [
+            "User-Agent": "Mozilla/5.0 (iPhone; CPU iPhone OS 17_0 like Mac OS X) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.0 Mobile/15E148 Safari/604.1",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9"
+        ]
+        self.session = URLSession(configuration: config)
+    }
+
+    // MARK: - Search
+
+    func search(query: String) async throws -> [AnnaSearchResult] {
+        // Prefer EPUB; the site uses "ext" parameter for format filtering
+        let encoded = query.addingPercentEncoding(withAllowedCharacters: .urlQueryAllowed) ?? query
+        let urlString = "\(APIConfig.annaArchiveBase)/search?q=\(encoded)&ext=epub"
+        guard let url = URL(string: urlString) else { throw AnnaError.invalidURL }
+
+        let (data, response) = try await session.data(from: url)
+
+        guard let http = response as? HTTPURLResponse else {
+            throw AnnaError.httpError(statusCode: -1)
+        }
+
+        // Handle potential redirects to CAPTCHA or block pages
+        if http.statusCode == 403 || http.statusCode == 503 {
+            throw AnnaError.blocked
+        }
+        guard http.statusCode == 200 else {
+            throw AnnaError.httpError(statusCode: http.statusCode)
+        }
+
+        guard let html = String(data: data, encoding: .utf8) else {
+            throw AnnaError.parseError("Could not decode response")
+        }
+
+        let results = parseSearchHTML(html)
+        if results.isEmpty {
+            throw AnnaError.noResults
+        }
+        return results
+    }
+
+    // MARK: - HTML Parsing (Search Results)
+
+    /// Extract book entries from the search page HTML.
+    ///
+    /// The current Anna's Archive search page structures each result roughly as:
+    ///   <a href="/md5/HASH">...cover...</a>
+    ///   <h3><a href="/md5/HASH">Title</a></h3>
+    ///   <div ...>Author</div>
+    ///   <div ...>epub, 2.5 MB, English, Publisher</div>
+    ///
+    /// We use regex to pull these out. This is inherently fragile.
+    private func parseSearchHTML(_ html: String) -> [AnnaSearchResult] {
+        var results: [AnnaSearchResult] = []
+
+        // 1. Find all MD5 detail links: href="/md5/..."
+        let md5Pattern = try! NSRegularExpression(pattern: #"href="(/md5/[^"]+)""#, options: [])
+        let md5Matches = md5Pattern.matches(in: html, range: NSRange(html.startIndex..., in: html))
+
+        for match in md5Matches {
+            guard let md5Range = Range(match.range(at: 1), in: html) else { continue }
+            let detailURL = String(html[md5Range])
+
+            // 2. Find the title — it's usually in an <h3> near the MD5 link.
+            //    We look for the next <h3> after this MD5 link in the HTML.
+            let afterMD5 = html[md5Range.upperBound...]
+            let titlePattern = try! NSRegularExpression(pattern: #"<h3[^>]*>\s*<a[^>]*>(.*?)</a>"#, options: [.dotMatchesLineSeparators])
+            if let titleMatch = titlePattern.firstMatch(in: String(afterMD5), range: NSRange(afterMD5.startIndex..., in: afterMD5)),
+               let titleRange = Range(titleMatch.range(at: 1), in: afterMD5) {
+                let rawTitle = String(afterMD5[titleRange])
+                let title = stripHTML(rawTitle)
+
+                // 3. Find author — look for a div/span with author info near the title
+                let afterTitle = afterMD5[titleRange.upperBound...]
+                let author = extractAuthor(from: String(afterTitle))
+
+                // 4. Find format/size info — look for "epub" or "pdf" with size
+                let (format, fileSize, language, publisher) = extractFileInfo(from: String(afterTitle))
+
+                results.append(AnnaSearchResult(
+                    id: detailURL,
+                    title: title,
+                    author: author,
+                    format: format,
+                    fileSize: fileSize,
+                    language: language,
+                    publisher: publisher,
+                    detailURL: detailURL
+                ))
+            }
+        }
+
+        return results
+    }
+
+    /// Try to find the author name in the text following a title.
+    private func extractAuthor(from html: String) -> String {
+        // Anna's Archive often has author in a div like:
+        // <div class="...">by <a href="...">Author Name</a></div>
+        let authorPattern = try! NSRegularExpression(
+            pattern: #"(?:by\s*)?<a[^>]*class="[^"]*author[^"]*"[^>]*>([^<]+)</a>"#,
+            options: [.caseInsensitive]
+        )
+        if let match = authorPattern.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let range = Range(match.range(at: 1), in: html) {
+            return String(html[range]).trimmingCharacters(in: .whitespaces)
+        }
+
+        // Fallback: look for any text that looks like an author line
+        let fallbackPattern = try! NSRegularExpression(
+            pattern: #"<div[^>]*>([^<]{3,60})</div>"#,
+            options: []
+        )
+        if let match = fallbackPattern.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let range = Range(match.range(at: 1), in: html) {
+            let text = String(html[range]).trimmingCharacters(in: .whitespaces)
+            // Skip if it looks like format info
+            if !text.lowercased().contains("mb") && !text.lowercased().contains("kb") && !text.lowercased().contains("epub") && !text.lowercased().contains("pdf") {
+                return text
+            }
+        }
+
+        return "Unknown Author"
+    }
+
+    /// Extract format, file size, language, and publisher from the metadata line.
+    private func extractFileInfo(from html: String) -> (format: String, size: String, language: String?, publisher: String?) {
+        var format = "unknown"
+        var size = ""
+        var language: String?
+        let publisher: String? = nil
+
+        let lowerHTML = html.lowercased()
+
+        if lowerHTML.contains("epub") { format = "EPUB" }
+        else if lowerHTML.contains("pdf") { format = "PDF" }
+        else if lowerHTML.contains("mobi") { format = "MOBI" }
+        else if lowerHTML.contains("azw3") { format = "AZW3" }
+
+        // File size: match patterns like "2.5 MB", "1,024 KB"
+        let sizePattern = try! NSRegularExpression(pattern: #"([\d.,]+\s*[KMGT]?B)"#, options: [])
+        if let match = sizePattern.firstMatch(in: html, range: NSRange(html.startIndex..., in: html)),
+           let range = Range(match.range(at: 1), in: html) {
+            size = String(html[range])
+        }
+
+        // Language detection (simple)
+        for lang in ["English", "Spanish", "French", "German", "Chinese", "Japanese", "Russian", "Portuguese", "Italian"] {
+            if lowerHTML.contains(lang.lowercased()) {
+                language = lang
+                break
+            }
+        }
+
+        // Publisher — often in the last div before the next result
+        // This is hard to reliably extract, so we skip it for now
+
+        return (format, size, language, publisher)
+    }
+
+    // MARK: - Get Mirror Links
+
+    /// Fetch the MD5 detail page and extract available download mirror links.
+    func getMirrorLinks(detailPath: String) async throws -> [AnnaMirrorLink] {
+        let urlString = "\(APIConfig.annaArchiveBase)\(detailPath)"
+        guard let url = URL(string: urlString) else { throw AnnaError.invalidURL }
+
+        let (data, response) = try await session.data(from: url)
+
+        guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
+            throw AnnaError.httpError(statusCode: (response as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        guard let html = String(data: data, encoding: .utf8) else {
+            throw AnnaError.parseError("Could not decode detail page")
+        }
+
+        return parseMirrorLinks(from: html)
+    }
+
+    /// Parse mirror download links from the MD5 detail page.
+    ///
+    /// Mirrors are typically in links like:
+    ///   <a href="https://archive.org/download/.../file.epub">...</a>
+    ///   <a href="https://1lib.sk/...">...</a>
+    private func parseMirrorLinks(from html: String) -> [AnnaMirrorLink] {
+        var links: [AnnaMirrorLink] = []
+
+        // Pattern 1: Direct download links (archive.org, etc.)
+        let directPattern = try! NSRegularExpression(
+            pattern: #"href="(https?://[^"]*(?:/download/|\.epub|\.pdf)[^"]*)""#,
+            options: [.caseInsensitive]
+        )
+
+        let directMatches = directPattern.matches(in: html, range: NSRange(html.startIndex..., in: html))
+        var seenURLs = Set<String>()
+
+        for match in directMatches {
+            guard let range = Range(match.range(at: 1), in: html) else { continue }
+            let rawURL = String(html[range])
+
+            // Clean up URL (remove HTML entities, etc.)
+            let cleanURL = rawURL
+                .replacingOccurrences(of: "&amp;", with: "&")
+
+            guard !seenURLs.contains(cleanURL) else { continue }
+            seenURLs.insert(cleanURL)
+
+            // Determine a label
+            let label: String
+            if cleanURL.contains("archive.org") { label = "Internet Archive" }
+            else if cleanURL.contains("1lib") { label = "Library Genesis" }
+            else { label = "Mirror" }
+
+            links.append(AnnaMirrorLink(id: UUID().uuidString, label: label, url: cleanURL))
+        }
+
+        // Pattern 2: Generic download links (fallback)
+        if links.isEmpty {
+            let genericPattern = try! NSRegularExpression(
+                pattern: #"href="(https?://[^"]*(?:dl|download|file)[^"]*)""#,
+                options: [.caseInsensitive]
+            )
+            let genericMatches = genericPattern.matches(in: html, range: NSRange(html.startIndex..., in: html))
+            for (i, match) in genericMatches.enumerated() {
+                guard let range = Range(match.range(at: 1), in: html) else { continue }
+                let rawURL = String(html[range]).replacingOccurrences(of: "&amp;", with: "&")
+                if !seenURLs.contains(rawURL) {
+                    seenURLs.insert(rawURL)
+                    links.append(AnnaMirrorLink(id: UUID().uuidString, label: "Mirror \(i + 1)", url: rawURL))
+                }
+            }
+        }
+
+        return links
+    }
+
+    // MARK: - Download File
+
+    /// Download a file from a mirror URL with progress reporting.
+    func downloadFile(from urlString: String, progressHandler: @Sendable @escaping (Double) -> Void) async throws -> URL {
+        guard let url = URL(string: urlString) else { throw AnnaError.invalidURL }
+
+        // First, get the total size with a HEAD request
+        var totalBytes: Int64 = 0
+        var finalURL = url
+
+        do {
+            var headRequest = URLRequest(url: url)
+            headRequest.httpMethod = "HEAD"
+            let (_, headResponse) = try await session.data(for: headRequest)
+            if let http = headResponse as? HTTPURLResponse {
+                if let redirect = http.value(forHTTPHeaderField: "Location"), let redURL = URL(string: redirect) {
+                    finalURL = redURL
+                }
+                totalBytes = http.expectedContentLength
+            }
+        } catch {
+            // HEAD may fail; proceed with GET and unknown size
+        }
+
+        let (asyncBytes, response) = try await session.bytes(for: URLRequest(url: finalURL))
+
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            throw AnnaError.httpError(statusCode: (response as? HTTPURLResponse)?.statusCode ?? -1)
+        }
+
+        // Determine file extension from URL or content-type
+        let ext = fileExtension(from: finalURL, response: http)
+        let fileName = "download_\(UUID().uuidString).\(ext)"
+        let destURL = FileManager.default.temporaryDirectory.appendingPathComponent(fileName)
+
+        var downloadedBytes: Int64 = 0
+        let fileHandle = try FileHandle(forWritingTo: destURL)
+
+        defer {
+            try? fileHandle.close()
+        }
+
+        for try await byte in asyncBytes {
+            try fileHandle.write(contentsOf: [byte])
+            downloadedBytes += 1
+            if totalBytes > 0 {
+                let progress = Double(downloadedBytes) / Double(totalBytes)
+                progressHandler(min(progress, 1.0))
+            }
+        }
+
+        // If we didn't know the size, report 100% at the end
+        if totalBytes <= 0 {
+            progressHandler(1.0)
+        }
+
+        return destURL
+    }
+
+    /// Determine file extension from the download URL or Content-Type header
+    private func fileExtension(from url: URL, response: HTTPURLResponse) -> String {
+        // Check URL path first
+        let pathExt = url.pathExtension.lowercased()
+        if ["epub", "pdf", "mobi", "azw3"].contains(pathExt) { return pathExt }
+
+        // Check Content-Type
+        let ct = (response.value(forHTTPHeaderField: "Content-Type") ?? "").lowercased()
+        if ct.contains("epub") { return "epub" }
+        if ct.contains("pdf") { return "pdf" }
+
+        // Default to epub
+        return "epub"
+    }
+
+    // MARK: - Helpers
+
+    private func stripHTML(_ html: String) -> String {
+        return html
+            .replacingOccurrences(of: "<[^>]+>", with: "", options: .regularExpression)
+            .replacingOccurrences(of: "&amp;", with: "&")
+            .replacingOccurrences(of: "&lt;", with: "<")
+            .replacingOccurrences(of: "&gt;", with: ">")
+            .replacingOccurrences(of: "&quot;", with: "\"")
+            .replacingOccurrences(of: "&#39;", with: "'")
+            .replacingOccurrences(of: "&nbsp;", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+    }
+
+    // MARK: - Errors
+
+    enum AnnaError: LocalizedError {
+        case invalidURL
+        case httpError(statusCode: Int)
+        case blocked
+        case noResults
+        case parseError(String)
+        case downloadFailed(String)
+
+        var errorDescription: String? {
+            switch self {
+            case .invalidURL: return "Invalid URL"
+            case .httpError(let code): return "Server returned HTTP \(code)"
+            case .blocked: return "Access blocked. Try again later or use Safari."
+            case .noResults: return "No results found on Anna's Archive"
+            case .parseError(let msg): return "Parse error: \(msg)"
+            case .downloadFailed(let msg): return "Download failed: \(msg)"
+            }
+        }
+    }
+}
+
