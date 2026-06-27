@@ -1,0 +1,39 @@
+name: iOS IPA
+
+on:
+  push:
+    branches: [ "main" ]
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Build Unsigned IPA
+        run: |
+          # Set a valid bundle ID that won't conflict
+          BUNDLE_ID="com.local.voxepub"
+          
+          # 1. Archive with proper bundle ID
+          xcodebuild archive \
+            -project VOXepub.xcodeproj \
+            -scheme VOXepub \
+            -archivePath build/VOXepub.xcarchive \
+            CODE_SIGNING_ALLOWED=NO \
+            PRODUCT_BUNDLE_IDENTIFIER="$BUNDLE_ID"
+          
+          # 2. Export the app
+          mkdir -p Payload
+          cp -r build/VOXepub.xcarchive/Products/Applications/*.app Payload/
+          
+          # 3. Zip it into an IPA
+          zip -r VOXepub.ipa Payload
+
+      - name: Upload IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: VOXepub-ipa
+          path: VOXepub.ipa
